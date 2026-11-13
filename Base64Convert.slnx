@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="src/Base64Convert.Core/Base64Convert.Core.csproj" />
+  <Project Path="src/Base64Convert.WinForms/Base64Convert.WinForms.csproj" />
+  <Project Path="tests/Base64Convert.Tests/Base64Convert.Tests.csproj" />
+  <Project Path="tests/Base64Convert.UiSmokeTests/Base64Convert.UiSmokeTests.csproj" />
+</Solution>
