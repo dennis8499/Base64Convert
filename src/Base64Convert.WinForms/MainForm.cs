@@ -12,14 +12,8 @@ public sealed class MainForm : Form
         DecimalPlaces = 2, Increment = 1, Minimum = 0.01M, Maximum = 1_000_000,
         Value = 15, Width = 115, ThousandsSeparator = true, AccessibleName = "每個文字分片上限（MB）"
     };
-    private readonly CheckBox _createInfo = new()
-    {
-        Text = "產生驗證資訊檔（記錄原始檔名、大小及 SHA-256）", AutoSize = true, Checked = true
-    };
     private readonly ListBox _partList = new() { Dock = DockStyle.Fill, HorizontalScrollbar = true, AccessibleName = "已選取的文字分片" };
     private readonly Label _partCount = new() { AutoSize = true, Text = "尚未選取分片" };
-    private readonly TextBox _infoPath = ReadOnlyPath("驗證資訊檔");
-    private readonly Label _infoHint = new() { AutoSize = true, ForeColor = SystemColors.GrayText };
     private readonly ProgressBar _progress = new() { Dock = DockStyle.Fill, Minimum = 0, Maximum = 100 };
     private readonly Label _status = new() { Dock = DockStyle.Fill, AutoSize = true, Text = "準備就緒。" };
     private readonly Button _cancel = new() { Text = "取消作業", AutoSize = true, Enabled = false };
@@ -62,7 +56,6 @@ public sealed class MainForm : Form
         root.Controls.Add(progressRow, 0, 3);
         Controls.Add(root);
 
-        UpdateInfoHint();
         FormClosing += OnFormClosing;
     }
 
@@ -85,9 +78,8 @@ public sealed class MainForm : Form
         sizeRow.Controls.Add(_partSize);
         sizeRow.Controls.Add(new Label { Text = "MB（1 MB = 1,000,000 位元組）", AutoSize = true, Margin = new Padding(4, 6, 0, 0) });
         AddAutoRow(layout, sizeRow);
-        _createInfo.Margin = new Padding(3, 12, 3, 3);
-        AddAutoRow(layout, _createInfo);
-        AddAutoRow(layout, Note("此大小限制適用於產生的文字檔；郵件附件編碼及信件內容可能增加實際郵件大小。"));
+        AddAutoRow(layout, Note("Brotli 品質 11 自動壓縮，僅在輸出較小時採用。檔名與 SHA-256 內嵌，還原一律驗證。"));
+        AddAutoRow(layout, Note("高品質壓縮可能需要較長時間。大小限制適用於文字檔；郵件附件編碼可能增加實際大小。"));
         var run = ActionButton("開始轉換", async (_, _) => await StartExportAsync());
         run.Margin = new Padding(3, 15, 3, 3);
         AddAutoRow(layout, LeftAligned(run));
@@ -108,12 +100,7 @@ public sealed class MainForm : Form
         _partList.Margin = new Padding(3, 8, 3, 3);
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         layout.Controls.Add(_partList, 0, layout.RowCount++);
-        AddAutoRow(layout, SectionLabel("驗證資訊檔（選用）"));
-        AddAutoRow(layout, PathRow(_infoPath,
-            ActionButton("選擇…", (_, _) => ChooseInfo()),
-            ActionButton("清除", (_, _) => { _infoPath.Clear(); UpdateInfoHint(); })));
-        _infoHint.Margin = new Padding(3, 5, 3, 3);
-        AddAutoRow(layout, _infoHint);
+        AddAutoRow(layout, Note("僅支援 v2 分片。還原時會自動辨識壓縮方式，並一律驗證原始檔案大小與 SHA-256。"));
         var run = ActionButton("選擇儲存位置並還原", async (_, _) => await StartRestoreAsync());
         run.Margin = new Padding(3, 12, 3, 3);
         AddAutoRow(layout, LeftAligned(run));
@@ -154,49 +141,32 @@ public sealed class MainForm : Form
         }
         finally { _partList.EndUpdate(); }
         _partCount.Text = $"已選取 {_selectedParts.Length:N0} 個分片";
-        _infoPath.Text = ConversionService.FindVerificationInfo(_selectedParts[0]) ?? "";
-        UpdateInfoHint();
-    }
-
-    private void ChooseInfo()
-    {
-        using var dialog = new OpenFileDialog
-        {
-            Title = "選擇驗證資訊檔", Filter = "驗證資訊檔 (*.json)|*.json|所有檔案 (*.*)|*.*", CheckFileExists = true
-        };
-        if (dialog.ShowDialog(this) != DialogResult.OK) return;
-        _infoPath.Text = dialog.FileName;
-        UpdateInfoHint();
-    }
-
-    private void UpdateInfoHint()
-    {
-        _infoHint.Text = string.IsNullOrWhiteSpace(_infoPath.Text)
-            ? "未使用資訊檔：無法驗證內容是否損毀；請確認還原檔名。"
-            : "還原時會檢查原始檔大小及 SHA-256。";
     }
 
     private async Task StartExportAsync()
     {
         if (_activeOperation is not null) return;
-        ExportPlan plan;
-        try
+        string source = _sourcePath.Text, directory = _outputDirectory.Text;
+        long limit = decimal.ToInt64(_partSize.Value * 1_000_000M);
+        await RunOperationAsync(async (progress, token) =>
         {
-            long limit = decimal.ToInt64(_partSize.Value * 1_000_000M);
-            plan = ConversionService.CreateExportPlan(_sourcePath.Text, _outputDirectory.Text, limit, _createInfo.Checked);
-        }
-        catch (Exception ex) { ShowError(ex); return; }
-
-        string[] existing = plan.OutputPaths.Where(File.Exists).ToArray();
-        if (existing.Length > 0 && MessageBox.Show(this,
-                $"有 {existing.Length:N0} 個輸出檔案已存在。確定要覆寫嗎？", "確認覆寫",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
-            return;
-
-        await RunOperationAsync(
-            (progress, token) => ConversionService.ExportAsync(plan, existing, progress, token),
-            $"轉換完成，共產生 {plan.PartPaths.Count:N0} 個文字分片。" +
-            (plan.ManifestPath is null ? "" : "\n已產生驗證資訊檔。") + $"\n\n輸出資料夾：{plan.DestinationDirectory}");
+            await using ExportPlan plan = await Task.Run(() =>
+                ConversionService.CreateExportPlanAsync(source, directory, limit, progress, token), token);
+            token.ThrowIfCancellationRequested();
+            if (_closeWhenDone || IsDisposed) return null;
+            string[] existing = plan.OutputPaths.Where(File.Exists).ToArray();
+            if (existing.Length > 0 && MessageBox.Show(this,
+                    $"有 {existing.Length:N0} 個輸出檔案已存在。確定要覆寫嗎？", "確認覆寫",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return null;
+            ExportResult result = await Task.Run(() => ConversionService.ExportAsync(plan, existing, progress, token), token);
+            string method = result.Compression == CompressionMethod.Brotli ? "Brotli（品質 11）" : "未壓縮（壓縮後沒有較小）";
+            double savings = result.SavedBytes * 100d / result.UncompressedEncodedBytes;
+            return $"轉換完成，共產生 {result.PartCount:N0} 個 v2 文字分片。\n" +
+                $"處理方式：{method}\n原始大小：{FormatBytes(result.OriginalBytes)}\n" +
+                $"文字總輸出：{FormatBytes(result.EncodedBytes)}\n較 v2 未壓縮輸出節省：{savings:N2}%\n" +
+                $"\n檔名、大小及 SHA-256 已內嵌。\n輸出資料夾：{directory}";
+        });
     }
 
     private async Task StartRestoreAsync()
@@ -208,58 +178,53 @@ public sealed class MainForm : Form
             return;
         }
 
-        RestorePlan? plan = null;
         string[] selectedParts = _selectedParts.ToArray();
-        string? info = string.IsNullOrWhiteSpace(_infoPath.Text) ? null : _infoPath.Text;
-        BeginOperation("正在檢查分片…");
-        try
+        await RunOperationAsync(async (progress, token) =>
         {
-            CancellationToken token = _activeOperation!.Token;
-            plan = await Task.Run(() => ConversionService.CreateRestorePlanAsync(selectedParts, info, token), token);
-        }
-        catch (OperationCanceledException) { _status.Text = "已取消。"; }
-        catch (Exception ex) { ShowError(ex); }
-        finally { EndOperation(); }
-        if (plan is null || _closeWhenDone || IsDisposed) return;
-
-        using var dialog = new SaveFileDialog
-        {
-            Title = "選擇還原檔案的儲存位置", FileName = plan.SuggestedFileName,
-            Filter = "所有檔案 (*.*)|*.*", AddExtension = false, OverwritePrompt = false
-        };
-        if (dialog.ShowDialog(this) != DialogResult.OK) return;
-        bool exists = File.Exists(dialog.FileName);
-        if (exists && MessageBox.Show(this, $"檔案已存在：\n{dialog.FileName}\n\n確定要覆寫嗎？", "確認覆寫",
-                MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
-            return;
-        await RunOperationAsync(
-            (progress, token) => ConversionService.RestoreAsync(plan, dialog.FileName, exists, progress, token),
-            $"檔案已還原：\n{dialog.FileName}" + (plan.Verification is null ? "\n\n未使用驗證資訊檔。" : "\n\n已通過大小及 SHA-256 驗證。"));
+            RestorePlan plan = await Task.Run(() => ConversionService.CreateRestorePlanAsync(selectedParts, token), token);
+            token.ThrowIfCancellationRequested();
+            if (_closeWhenDone || IsDisposed) return null;
+            using var dialog = new SaveFileDialog
+            {
+                Title = $"選擇還原位置（原始大小：{FormatBytes(plan.Metadata.OriginalLength)}）", FileName = plan.SuggestedFileName,
+                Filter = "所有檔案 (*.*)|*.*", AddExtension = false, OverwritePrompt = false
+            };
+            if (dialog.ShowDialog(this) != DialogResult.OK) return null;
+            bool exists = File.Exists(dialog.FileName);
+            if (exists && MessageBox.Show(this, $"檔案已存在：\n{dialog.FileName}\n\n確定要覆寫嗎？", "確認覆寫",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return null;
+            await Task.Run(() => ConversionService.RestoreAsync(plan, dialog.FileName, exists, progress, token), token);
+            return $"檔案已還原：\n{dialog.FileName}\n\n已通過大小及 SHA-256 驗證。";
+        });
     }
 
-    private async Task RunOperationAsync(Func<IProgress<ConversionProgress>, CancellationToken, Task> work, string successMessage)
+    private async Task RunOperationAsync(Func<IProgress<ConversionProgress>, CancellationToken, Task<string?>> work)
     {
         BeginOperation("正在準備…");
+        CancellationTokenSource operation = _activeOperation!;
         var progress = new Progress<ConversionProgress>(value =>
         {
-            if (_activeOperation is null || IsDisposed) return;
-            int percent = value.TotalBytes == 0 ? 0 : (int)Math.Clamp(value.ProcessedBytes * 100d / value.TotalBytes, 0, 100);
+            if (!ReferenceEquals(_activeOperation, operation) || IsDisposed || operation.IsCancellationRequested) return;
+            int percent = value.TotalBytes == 0 ? 0 : (int)Math.Clamp(value.ProcessedBytes * 100d / value.TotalBytes, 0, 99);
             _progress.Value = percent;
             _status.Text = $"{value.Message}：{percent}%（{FormatBytes(value.ProcessedBytes)} / {FormatBytes(value.TotalBytes)}）";
         });
-        bool succeeded = false;
+        string? successMessage = null;
         try
         {
-            CancellationToken token = _activeOperation!.Token;
-            await Task.Run(() => work(progress, token), token);
-            succeeded = true;
-            _progress.Value = 100;
-            _status.Text = "作業完成。";
+            successMessage = await work(progress, operation.Token);
+            if (successMessage is not null)
+            {
+                _progress.Value = 100;
+                _status.Text = "作業完成。";
+            }
+            else _status.Text = "已取消。";
         }
         catch (OperationCanceledException) { _status.Text = "已取消。"; }
         catch (Exception ex) { ShowError(ex); }
         finally { EndOperation(); }
-        if (succeeded && !_closeWhenDone && !IsDisposed)
+        if (successMessage is not null && !_closeWhenDone && !IsDisposed)
             MessageBox.Show(this, successMessage, "作業完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 

@@ -1,398 +1,484 @@
 using System.Buffers;
 using System.Buffers.Text;
+using System.IO.Compression;
 using System.Security.Cryptography;
-using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace Base64Convert.Core;
 
 public sealed record ConversionProgress(string Message, long ProcessedBytes, long TotalBytes);
+public enum CompressionMethod { None, Brotli }
 
-public sealed record VerificationInfo
+public sealed record PackageMetadata
 {
-    [JsonRequired]
-    public int FormatVersion { get; init; } = 1;
-    [JsonRequired]
-    public string SetId { get; init; } = "";
-    [JsonRequired]
-    public string OriginalFileName { get; init; } = "";
-    [JsonRequired]
-    public long OriginalLength { get; init; }
-    [JsonRequired]
-    public int PartCount { get; init; }
-    [JsonRequired]
-    public string Sha256 { get; init; } = "";
+    [JsonRequired] public int FormatVersion { get; init; } = 2;
+    [JsonRequired] public string SetId { get; init; } = "";
+    [JsonRequired] public string OriginalFileName { get; init; } = "";
+    [JsonRequired] public long OriginalLength { get; init; }
+    [JsonRequired] public long PayloadLength { get; init; }
+    [JsonRequired] public CompressionMethod Compression { get; init; }
+    [JsonRequired] public string Sha256 { get; init; } = "";
 }
 
-public sealed class ExportPlan
+public sealed record ExportResult(CompressionMethod Compression, long OriginalBytes, long PayloadBytes,
+    long EncodedBytes, long UncompressedEncodedBytes, int PartCount)
 {
-    internal ExportPlan(string sourcePath, string destinationDirectory, long sourceLength,
-        long partByteLimit, long inputBytesPerPart, string setId, string[] partPaths, string? manifestPath)
+    public long SavedBytes => UncompressedEncodedBytes - EncodedBytes;
+}
+
+/// <summary>A single-use prepared export. Dispose even when declining to export.</summary>
+public sealed class ExportPlan : IAsyncDisposable
+{
+    private readonly FileStream _source;
+    private readonly Stream _payload;
+    private int _state; // 0 prepared, 1 exporting, 2 finished, 3 disposed
+    internal ExportPlan(string sourcePath, string directory, long limit, string[] paths,
+        PackageMetadata metadata, byte[] header, long baseline, string stage,
+        FileStream source, Stream payload, ConversionFileOperations files)
     {
         SourcePath = sourcePath;
-        DestinationDirectory = destinationDirectory;
-        SourceLength = sourceLength;
-        PartByteLimit = partByteLimit;
-        InputBytesPerPart = inputBytesPerPart;
-        SetId = setId;
-        PartPaths = Array.AsReadOnly(partPaths);
-        ManifestPath = manifestPath;
+        DestinationDirectory = directory;
+        PartByteLimit = limit;
+        PartPaths = Array.AsReadOnly(paths);
+        Metadata = metadata;
+        Header = header;
+        EncodedLength = PackageFormat.EncodedLength(checked(header.LongLength + metadata.PayloadLength));
+        UncompressedEncodedLength = baseline;
+        Stage = stage;
+        _source = source;
+        _payload = payload;
+        Files = files;
     }
-
     public string SourcePath { get; }
     public string DestinationDirectory { get; }
-    public long SourceLength { get; }
+    public long SourceLength => Metadata.OriginalLength;
     public long PartByteLimit { get; }
-    public long InputBytesPerPart { get; }
-    public string SetId { get; }
     public IReadOnlyList<string> PartPaths { get; }
-    public string? ManifestPath { get; }
-
-    public IEnumerable<string> OutputPaths => ManifestPath is null
-        ? PartPaths
-        : PartPaths.Append(ManifestPath);
+    public IEnumerable<string> OutputPaths => PartPaths;
+    public PackageMetadata Metadata { get; }
+    public long EncodedLength { get; }
+    public long UncompressedEncodedLength { get; }
+    internal byte[] Header { get; }
+    internal string Stage { get; }
+    internal Stream Payload => _payload;
+    internal ConversionFileOperations Files { get; }
+    internal bool KeepBackups { get; set; }
+    internal void BeginExport()
+    {
+        if (Interlocked.CompareExchange(ref _state, 1, 0) != 0)
+            throw new InvalidOperationException("匯出計畫只能執行一次，且不可在釋放後使用。");
+    }
+    internal void FinishExport() => Interlocked.CompareExchange(ref _state, 2, 1);
+    public async ValueTask DisposeAsync()
+    {
+        int previous;
+        do
+        {
+            previous = Volatile.Read(ref _state);
+            if (previous == 3) return;
+            if (previous == 1) throw new InvalidOperationException("匯出進行中，不可釋放計畫。");
+        } while (Interlocked.CompareExchange(ref _state, 3, previous) != previous);
+        var errors = new List<Exception>();
+        try { if (!ReferenceEquals(_payload, _source)) await _payload.DisposeAsync(); }
+        catch (Exception ex) { errors.Add(ex); }
+        try { await _source.DisposeAsync(); }
+        catch (Exception ex) { errors.Add(ex); }
+        if (!KeepBackups)
+        {
+            try { Files.DeleteDirectory(Stage); }
+            catch (Exception ex) { errors.Add(ex); }
+        }
+        if (errors.Count > 0)
+            throw new IOException($"無法完整清理暫存資料，請檢查：{Stage}", new AggregateException(errors));
+    }
 }
 
 public sealed record PartFile(string Path, long Length);
-
 public sealed class RestorePlan
 {
-    internal RestorePlan(PartFile[] parts, string suggestedFileName, string? manifestPath,
-        VerificationInfo? verification, long encodedLength)
+    internal RestorePlan(PartFile[] parts, PackageMetadata metadata, byte[] header, long encodedLength)
     {
         Parts = Array.AsReadOnly(parts);
-        SuggestedFileName = suggestedFileName;
-        ManifestPath = manifestPath;
-        Verification = verification;
+        Metadata = metadata;
+        Header = header;
         EncodedLength = encodedLength;
     }
-
     public IReadOnlyList<PartFile> Parts { get; }
-    public string SuggestedFileName { get; }
-    public string? ManifestPath { get; }
-    public VerificationInfo? Verification { get; }
+    public PackageMetadata Metadata { get; }
+    public string SuggestedFileName => Metadata.OriginalFileName;
     public long EncodedLength { get; }
+    internal byte[] Header { get; }
 }
 
-/// <summary>Converts streams without loading a whole file into memory.</summary>
+/// <summary>Streams v2 packages with bounded buffers and mandatory integrity verification.</summary>
 public static partial class ConversionService
 {
-    private const int InputBufferSize = 192 * 1024; // A multiple of three.
-    private const int EncodedBufferSize = InputBufferSize / 3 * 4;
+    internal const int InputBufferSize = 192 * 1024;
+    internal const int EncodedBufferSize = InputBufferSize / 3 * 4;
     private const int MaximumPartCount = 999_999;
-    private const int MaximumNamePrefixLength = 200;
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly StringComparer PathComparer = OperatingSystem.IsWindows()
         ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-
-    [GeneratedRegex(@"^(?<name>.+)\.(?<id>[a-fA-F0-9]{12})\.part(?<index>\d{6})-of-(?<count>\d{6})\.txt$", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"^(?<name>.+)\.(?<id>[a-fA-F0-9]{12})\.v2\.part(?<index>\d{6})-of-(?<count>\d{6})\.txt$", RegexOptions.CultureInvariant)]
     private static partial Regex PartNamePattern();
 
-    public static ExportPlan CreateExportPlan(string sourcePath, string destinationDirectory,
-        long maximumPartBytes, bool createVerificationInfo)
+    public static Task<ExportPlan> CreateExportPlanAsync(string sourcePath, string destinationDirectory,
+        long maximumPartBytes, IProgress<ConversionProgress>? progress = null,
+        CancellationToken cancellationToken = default) =>
+        PrepareAsync(sourcePath, destinationDirectory, maximumPartBytes, ConversionFileOperations.Real, progress, cancellationToken);
+
+    internal static async Task<ExportPlan> PrepareAsync(string sourcePath, string destinationDirectory,
+        long maximumPartBytes, ConversionFileOperations files, IProgress<ConversionProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrWhiteSpace(sourcePath) || !File.Exists(sourcePath))
             throw new FileNotFoundException("找不到來源檔案。", sourcePath);
         if (string.IsNullOrWhiteSpace(destinationDirectory) || !Directory.Exists(destinationDirectory))
             throw new DirectoryNotFoundException("找不到輸出資料夾。");
         if (maximumPartBytes < 4)
             throw new ArgumentOutOfRangeException(nameof(maximumPartBytes), "分片大小至少需要 4 位元組。");
-
         sourcePath = Path.GetFullPath(sourcePath);
         destinationDirectory = Path.GetFullPath(destinationDirectory);
-        var fileName = Path.GetFileName(sourcePath);
-        long sourceLength = new FileInfo(sourcePath).Length;
-        long alignedLimit = maximumPartBytes - maximumPartBytes % 4;
-        long inputPerPart = alignedLimit / 4 * 3;
-        long partCount = sourceLength == 0 ? 1 : sourceLength / inputPerPart + (sourceLength % inputPerPart == 0 ? 0 : 1);
-        if (partCount > MaximumPartCount)
-            throw new InvalidOperationException($"分片數量超過 {MaximumPartCount:N0} 個，請調大每個分片的大小。");
-
-        // Keep component names below Windows' usual 255-character limit. The full name is in the optional manifest.
-        string prefix = fileName.Length <= MaximumNamePrefixLength ? fileName : fileName[..MaximumNamePrefixLength];
-        if (char.IsHighSurrogate(prefix[^1])) prefix = prefix[..^1];
-        string setId = Guid.NewGuid().ToString("N")[..12];
-        string stem = $"{prefix}.{setId}";
-        var parts = Enumerable.Range(1, (int)partCount)
-            .Select(i => Path.Combine(destinationDirectory, $"{stem}.part{i:D6}-of-{partCount:D6}.txt"))
-            .ToArray();
-        string? manifest = createVerificationInfo ? Path.Combine(destinationDirectory, $"{stem}.base64.json") : null;
-        if (parts.Any(p => PathComparer.Equals(p, sourcePath)) || (manifest is not null && PathComparer.Equals(manifest, sourcePath)))
-            throw new IOException("輸出檔案不可與來源檔案相同。");
-        return new ExportPlan(sourcePath, destinationDirectory, sourceLength, alignedLimit, inputPerPart, setId, parts, manifest);
+        long limit = maximumPartBytes - maximumPartBytes % 4;
+        string stage = Path.Combine(destinationDirectory, $".base64convert-{Guid.NewGuid():N}.tmp");
+        var source = new FileStream(sourcePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            InputBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        Stream? payload = null;
+        try
+        {
+            Directory.CreateDirectory(stage);
+            string compressedPath = Path.Combine(stage, "payload.br");
+            string sha;
+            long sourceLength = source.Length;
+            using (var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256))
+            {
+                await using (Stream output = files.CreateOutput(compressedPath, InputBufferSize))
+                    await CompressAsync(source, output, hash, progress, cancellationToken);
+                sha = Convert.ToHexString(hash.GetHashAndReset());
+            }
+            var raw = new PackageMetadata
+            {
+                SetId = Guid.NewGuid().ToString("N")[..12], OriginalFileName = Path.GetFileName(sourcePath),
+                OriginalLength = sourceLength, PayloadLength = sourceLength,
+                Compression = CompressionMethod.None, Sha256 = sha
+            };
+            byte[] rawHeader = PackageFormat.CreateHeader(raw);
+            long baseline = PackageFormat.EncodedLength(checked(rawHeader.LongLength + sourceLength));
+            var packed = raw with { Compression = CompressionMethod.Brotli, PayloadLength = new FileInfo(compressedPath).Length };
+            byte[] packedHeader = PackageFormat.CreateHeader(packed);
+            long packedLength = PackageFormat.EncodedLength(checked(packedHeader.LongLength + packed.PayloadLength));
+            bool useCompression = packedLength < baseline;
+            PackageMetadata metadata = useCompression ? packed : raw;
+            byte[] header = useCompression ? packedHeader : rawHeader;
+            long encodedLength = useCompression ? packedLength : baseline;
+            long count = encodedLength / limit + (encodedLength % limit == 0 ? 0 : 1);
+            if (count > MaximumPartCount)
+                throw new InvalidOperationException($"分片數量超過 {MaximumPartCount:N0} 個，請調大每個分片的大小。");
+            string prefix = raw.OriginalFileName.Length <= 200 ? raw.OriginalFileName : raw.OriginalFileName[..200];
+            if (char.IsHighSurrogate(prefix[^1])) prefix = prefix[..^1];
+            string[] paths = Enumerable.Range(1, (int)count).Select(i => Path.Combine(destinationDirectory,
+                $"{prefix}.{raw.SetId}.v2.part{i:D6}-of-{count:D6}.txt")).ToArray();
+            if (paths.Any(p => PathComparer.Equals(p, sourcePath))) throw new IOException("輸出檔案不可與來源檔案相同。");
+            if (useCompression)
+                payload = new FileStream(compressedPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    InputBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            else
+            {
+                files.DeleteFile(compressedPath);
+                source.Position = 0;
+                payload = source;
+            }
+            files.EnsureSpace(destinationDirectory, encodedLength);
+            cancellationToken.ThrowIfCancellationRequested();
+            return new ExportPlan(sourcePath, destinationDirectory, limit, paths, metadata, header,
+                baseline, stage, source, payload, files);
+        }
+        catch (Exception error)
+        {
+            var cleanupErrors = new List<Exception>();
+            try { if (payload is not null && !ReferenceEquals(payload, source)) await payload.DisposeAsync(); }
+            catch (Exception cleanup) { cleanupErrors.Add(cleanup); }
+            try { await source.DisposeAsync(); }
+            catch (Exception cleanup) { cleanupErrors.Add(cleanup); }
+            try { files.DeleteDirectory(stage); }
+            catch (Exception cleanup) { cleanupErrors.Add(cleanup); }
+            if (cleanupErrors.Count > 0) throw CleanupError(error, new AggregateException(cleanupErrors), stage);
+            throw;
+        }
     }
 
-    public static async Task ExportAsync(ExportPlan plan, IEnumerable<string> approvedOverwrites,
+    private static async Task CompressAsync(Stream source, Stream destination, IncrementalHash hash,
+        IProgress<ConversionProgress>? progress, CancellationToken token)
+    {
+        var input = new byte[InputBufferSize];
+        var output = new byte[InputBufferSize];
+        var encoder = new BrotliEncoder(11, 22);
+        var reporter = new ProgressReporter(progress, "正在分析與壓縮", source.Length);
+        reporter.Report(0, true);
+        long processed = 0;
+        try
+        {
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                int read = await source.ReadAsync(input, token);
+                bool final = read == 0;
+                if (!final) hash.AppendData(input, 0, read);
+                int offset = 0;
+                OperationStatus status;
+                do
+                {
+                    token.ThrowIfCancellationRequested();
+                    status = encoder.Compress(input.AsSpan(offset, read - offset), output,
+                        out int consumed, out int written, final);
+                    if (status == OperationStatus.InvalidData) throw new InvalidDataException("Brotli 壓縮失敗。");
+                    offset += consumed;
+                    await destination.WriteAsync(output.AsMemory(0, written), token);
+                } while (offset < read || status == OperationStatus.DestinationTooSmall);
+                processed += read;
+                reporter.Report(processed);
+                if (final)
+                {
+                    if (status != OperationStatus.Done) throw new InvalidDataException("Brotli 壓縮未完整結束。");
+                    break;
+                }
+            }
+            if (processed != source.Length) throw new IOException("來源檔案大小已變更，請重新開始轉換。");
+        }
+        finally { encoder.Dispose(); } // Cancellation abandons the encoder without finalizing it.
+    }
+
+    public static async Task<ExportResult> ExportAsync(ExportPlan plan, IEnumerable<string> approvedOverwrites,
         IProgress<ConversionProgress>? progress = null, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(plan);
-        var approved = new HashSet<string>(approvedOverwrites.Select(Path.GetFullPath), PathComparer);
-        cancellationToken.ThrowIfCancellationRequested();
-        await using var input = new FileStream(plan.SourcePath, FileMode.Open, FileAccess.Read, FileShare.Read,
-            InputBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        if (input.Length != plan.SourceLength)
-            throw new IOException("來源檔案大小已變更，請重新開始轉換。");
-
-        string stage = Path.Combine(plan.DestinationDirectory, $".base64convert-{Guid.NewGuid():N}.tmp");
-        Directory.CreateDirectory(stage);
-        bool keepStage = false;
+        ArgumentNullException.ThrowIfNull(approvedOverwrites);
+        plan.BeginExport();
         try
         {
-            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            var inputBuffer = new byte[InputBufferSize];
-            var encodedBuffer = new byte[EncodedBufferSize];
+            var approved = new HashSet<string>(approvedOverwrites.Select(Path.GetFullPath), PathComparer);
+            cancellationToken.ThrowIfCancellationRequested();
+            plan.Files.EnsureSpace(plan.DestinationDirectory, plan.EncodedLength);
+            var input = new byte[InputBufferSize];
+            var encoded = new byte[EncodedBufferSize];
             var stagedFiles = new List<(string Staged, string Destination)>();
-            long processed = 0;
-            var reporter = new ProgressReporter(progress, "正在轉換檔案", plan.SourceLength);
+            long containerLength = checked(plan.Header.LongLength + plan.Metadata.PayloadLength);
+            long position = 0;
+            var reporter = new ProgressReporter(progress, "正在編碼與拆分", containerLength);
             reporter.Report(0, true);
-
             for (int i = 0; i < plan.PartPaths.Count; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                string staged = Path.Combine(stage, $"part-{i:D6}");
+                string staged = Path.Combine(plan.Stage, $"part-{i:D6}");
                 stagedFiles.Add((staged, plan.PartPaths[i]));
-                await using var output = new FileStream(staged, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                    EncodedBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                long remaining = Math.Min(plan.InputBytesPerPart, plan.SourceLength - processed);
+                await using Stream output = plan.Files.CreateOutput(staged, EncodedBufferSize);
+                long remaining = Math.Min(plan.PartByteLimit / 4 * 3, containerLength - position);
                 while (remaining > 0)
                 {
-                    int read = (int)Math.Min(inputBuffer.Length, remaining);
-                    await input.ReadExactlyAsync(inputBuffer.AsMemory(0, read), cancellationToken);
-                    hash.AppendData(inputBuffer, 0, read);
-                    OperationStatus status = Base64.EncodeToUtf8(inputBuffer.AsSpan(0, read), encodedBuffer, out int consumed, out int written);
-                    if (status != OperationStatus.Done || consumed != read)
-                        throw new InvalidDataException("Base64 編碼失敗。");
-                    await output.WriteAsync(encodedBuffer.AsMemory(0, written), cancellationToken);
-                    remaining -= read;
-                    processed += read;
-                    reporter.Report(processed);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    int count = (int)Math.Min(input.Length, remaining);
+                    int fromHeader = (int)Math.Min(count, Math.Max(0, plan.Header.LongLength - position));
+                    if (fromHeader > 0) plan.Header.AsMemory((int)position, fromHeader).CopyTo(input);
+                    if (fromHeader < count)
+                        await plan.Payload.ReadExactlyAsync(input.AsMemory(fromHeader, count - fromHeader), cancellationToken);
+                    var status = Base64.EncodeToUtf8(input.AsSpan(0, count), encoded, out int consumed, out int written);
+                    if (status != OperationStatus.Done || consumed != count) throw new InvalidDataException("Base64 編碼失敗。");
+                    await output.WriteAsync(encoded.AsMemory(0, written), cancellationToken);
+                    position += count;
+                    remaining -= count;
+                    reporter.Report(position);
                 }
             }
-
-            if (plan.ManifestPath is not null)
-            {
-                string staged = Path.Combine(stage, "manifest");
-                var info = new VerificationInfo
-                {
-                    SetId = plan.SetId,
-                    OriginalFileName = Path.GetFileName(plan.SourcePath),
-                    OriginalLength = plan.SourceLength,
-                    PartCount = plan.PartPaths.Count,
-                    Sha256 = Convert.ToHexString(hash.GetHashAndReset())
-                };
-                await using (var stream = new FileStream(staged, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                    4096, FileOptions.Asynchronous))
-                    await JsonSerializer.SerializeAsync(stream, info, JsonOptions, cancellationToken);
-                stagedFiles.Add((staged, plan.ManifestPath));
-            }
-
             cancellationToken.ThrowIfCancellationRequested();
-            reporter.Report(plan.SourceLength, true);
-            try
-            {
-                CommitFiles(stagedFiles, stage, approved, cancellationToken);
-            }
-            catch (RollbackFailedException)
-            {
-                keepStage = true;
-                throw;
-            }
+            CommitFiles(stagedFiles, plan, approved, progress, cancellationToken);
+            var result = new ExportResult(plan.Metadata.Compression, plan.SourceLength, plan.Metadata.PayloadLength,
+                plan.EncodedLength, plan.UncompressedEncodedLength, plan.PartPaths.Count);
+            plan.FinishExport();
+            await plan.DisposeAsync();
+            return result;
         }
-        finally
+        catch (Exception error)
         {
-            if (!keepStage) DeleteTemporaryDirectory(stage);
+            plan.FinishExport();
+            try { await plan.DisposeAsync(); }
+            catch (Exception cleanup) { throw CleanupError(error, cleanup, plan.Stage); }
+            throw;
         }
-    }
-
-    public static string? FindVerificationInfo(string partPath)
-    {
-        string fullPath = Path.GetFullPath(partPath);
-        Match match = PartNamePattern().Match(Path.GetFileName(fullPath));
-        if (!match.Success) return null;
-        string path = Path.Combine(Path.GetDirectoryName(fullPath)!,
-            $"{match.Groups["name"].Value}.{match.Groups["id"].Value}.base64.json");
-        return File.Exists(path) ? path : null;
     }
 
     public static async Task<RestorePlan> CreateRestorePlanAsync(IEnumerable<string> partPaths,
-        string? verificationPath = null, CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(partPaths);
-        string[] paths = partPaths.Select(Path.GetFullPath).ToArray();
-        if (paths.Length == 0) throw new InvalidDataException("請選取要還原的文字分片。");
+        cancellationToken.ThrowIfCancellationRequested();
         var indexed = new SortedDictionary<int, PartFile>();
         string? setId = null, prefix = null;
         int expectedCount = 0;
         long encodedLength = 0;
-        foreach (string path in paths)
+        foreach (string path in partPaths.Select(Path.GetFullPath))
         {
             cancellationToken.ThrowIfCancellationRequested();
             Match match = PartNamePattern().Match(Path.GetFileName(path));
-            if (!match.Success) throw new InvalidDataException($"不是本程式產生的分片檔名：{Path.GetFileName(path)}");
+            if (!match.Success) throw new InvalidDataException("僅支援 v2 文字分片，請使用新版程式重新轉換。");
             string currentId = match.Groups["id"].Value;
             string currentPrefix = match.Groups["name"].Value;
             int index = int.Parse(match.Groups["index"].Value);
             int count = int.Parse(match.Groups["count"].Value);
-            if (count < 1 || index < 1 || index > count)
-                throw new InvalidDataException("分片編號或總數無效。");
-            if (setId is null)
-            {
-                setId = currentId;
-                prefix = currentPrefix;
-                expectedCount = count;
-            }
+            if (count < 1 || index < 1 || index > count) throw new InvalidDataException("分片編號或總數無效。");
+            if (setId is null) { setId = currentId; prefix = currentPrefix; expectedCount = count; }
             else if (!StringComparer.OrdinalIgnoreCase.Equals(setId, currentId) ||
-                     !PathComparer.Equals(prefix, currentPrefix) || count != expectedCount)
+                !PathComparer.Equals(prefix, currentPrefix) || count != expectedCount)
                 throw new InvalidDataException("選取的分片不屬於同一組檔案。");
-            var file = new FileInfo(path);
-            if (!file.Exists) throw new FileNotFoundException("找不到分片檔案。", path);
-            if (file.Length % 4 != 0 || (file.Length == 0 && count != 1))
-                throw new InvalidDataException($"分片長度無效：{file.Name}");
-            if (!indexed.TryAdd(index, new PartFile(path, file.Length)))
-                throw new InvalidDataException($"分片編號重複：{index}");
-            encodedLength = checked(encodedLength + file.Length);
+            var info = new FileInfo(path);
+            if (!info.Exists) throw new FileNotFoundException("找不到分片檔案。", path);
+            if (info.Length == 0 || info.Length % 4 != 0) throw new InvalidDataException("分片長度無效。");
+            if (!indexed.TryAdd(index, new PartFile(path, info.Length))) throw new InvalidDataException($"分片編號重複：{index}");
+            encodedLength = checked(encodedLength + info.Length);
         }
+        if (indexed.Count == 0) throw new InvalidDataException("請選取要還原的文字分片。");
         if (indexed.Count != expectedCount || indexed.Keys.First() != 1 || indexed.Keys.Last() != expectedCount)
             throw new InvalidDataException($"分片不完整：需要 {expectedCount} 個，目前選取 {indexed.Count} 個。");
-
-        VerificationInfo? verification = null;
-        if (!string.IsNullOrWhiteSpace(verificationPath))
+        PartFile[] parts = indexed.Values.ToArray();
+        await using var decoded = new Base64PartReader(parts);
+        var (metadata, header) = await PackageFormat.ReadHeaderAsync(decoded, cancellationToken);
+        if (!StringComparer.OrdinalIgnoreCase.Equals(metadata.SetId, setId)) throw new InvalidDataException("容器與分片組別不符。");
+        try
         {
-            verificationPath = Path.GetFullPath(verificationPath);
-            var infoFile = new FileInfo(verificationPath);
-            if (!infoFile.Exists) throw new FileNotFoundException("找不到驗證資訊檔。", verificationPath);
-            if (infoFile.Length > 1024 * 1024) throw new InvalidDataException("驗證資訊檔過大。");
-            try
-            {
-                await using var stream = new FileStream(verificationPath, FileMode.Open, FileAccess.Read, FileShare.Read,
-                    4096, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                verification = await JsonSerializer.DeserializeAsync<VerificationInfo>(stream, cancellationToken: cancellationToken);
-            }
-            catch (JsonException ex)
-            {
-                throw new InvalidDataException("驗證資訊檔格式無效。", ex);
-            }
-            if (verification is null || verification.FormatVersion != 1 ||
-                !StringComparer.OrdinalIgnoreCase.Equals(verification.SetId, setId) ||
-                verification.PartCount != expectedCount || verification.OriginalLength < 0 ||
-                string.IsNullOrWhiteSpace(verification.OriginalFileName) ||
-                verification.OriginalFileName != Path.GetFileName(verification.OriginalFileName) ||
-                verification.OriginalFileName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 ||
-                verification.OriginalFileName is "." or ".." ||
-                verification.Sha256 is null || verification.Sha256.Length != 64 ||
-                !verification.Sha256.All(Uri.IsHexDigit))
-                throw new InvalidDataException("驗證資訊檔與分片不符，或其中的資料無效。");
+            if (PackageFormat.EncodedLength(checked(header.LongLength + metadata.PayloadLength)) != encodedLength)
+                throw new InvalidDataException("分片總長度與容器資訊不符。");
         }
-        else
-        {
-            verificationPath = null;
-        }
-        return new RestorePlan(indexed.Values.ToArray(), verification?.OriginalFileName ?? prefix!,
-            verificationPath, verification, encodedLength);
+        catch (OverflowException ex) { throw new InvalidDataException("容器長度超出支援範圍。", ex); }
+        return new RestorePlan(parts, metadata, header, encodedLength);
     }
 
-    public static async Task RestoreAsync(RestorePlan plan, string destinationPath, bool overwriteApproved,
-        IProgress<ConversionProgress>? progress = null, CancellationToken cancellationToken = default)
+    public static Task RestoreAsync(RestorePlan plan, string destinationPath, bool overwriteApproved,
+        IProgress<ConversionProgress>? progress = null, CancellationToken cancellationToken = default) =>
+        RestoreWithFilesAsync(plan, destinationPath, overwriteApproved, ConversionFileOperations.Real, progress, cancellationToken);
+
+    internal static async Task RestoreWithFilesAsync(RestorePlan plan, string destinationPath, bool overwriteApproved,
+        ConversionFileOperations files, IProgress<ConversionProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(plan);
         destinationPath = Path.GetFullPath(destinationPath);
-        if (plan.Parts.Any(p => PathComparer.Equals(p.Path, destinationPath)) ||
-            (plan.ManifestPath is not null && PathComparer.Equals(plan.ManifestPath, destinationPath)))
-            throw new IOException("還原位置不可與分片或驗證資訊檔相同。");
+        if (plan.Parts.Any(p => PathComparer.Equals(p.Path, destinationPath))) throw new IOException("還原位置不可與分片相同。");
         string directory = Path.GetDirectoryName(destinationPath)!;
         if (!Directory.Exists(directory)) throw new DirectoryNotFoundException("找不到還原目的地資料夾。");
+        cancellationToken.ThrowIfCancellationRequested();
+        files.EnsureSpace(directory, plan.Metadata.OriginalLength);
         string staged = Path.Combine(directory, $".base64convert-{Guid.NewGuid():N}.tmp");
-        bool installed = false;
         try
         {
-            cancellationToken.ThrowIfCancellationRequested();
             using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            var encodedBuffer = new byte[EncodedBufferSize];
-            var outputBuffer = new byte[InputBufferSize];
-            long processed = 0, decodedLength = 0;
-            var reporter = new ProgressReporter(progress, "正在還原檔案", plan.EncodedLength);
-            reporter.Report(0, true);
-            await using (var output = new FileStream(staged, FileMode.CreateNew, FileAccess.Write, FileShare.None,
-                InputBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var decoded = new Base64PartReader(plan.Parts, progress, plan.EncodedLength))
             {
-                for (int i = 0; i < plan.Parts.Count; i++)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    PartFile part = plan.Parts[i];
-                    await using var input = new FileStream(part.Path, FileMode.Open, FileAccess.Read, FileShare.Read,
-                        EncodedBufferSize, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                    if (input.Length != part.Length) throw new IOException("分片大小已變更，請重新選取分片。");
-                    long remaining = part.Length;
-                    while (remaining > 0)
-                    {
-                        int read = (int)Math.Min(encodedBuffer.Length, remaining);
-                        await input.ReadExactlyAsync(encodedBuffer.AsMemory(0, read), cancellationToken);
-                        bool finalBlock = i == plan.Parts.Count - 1 && remaining == read;
-                        ValidateBase64Characters(encodedBuffer, read, finalBlock);
-                        OperationStatus status = Base64.DecodeFromUtf8(encodedBuffer.AsSpan(0, read), outputBuffer,
-                            out int consumed, out int written, isFinalBlock: finalBlock);
-                        if (status != OperationStatus.Done || consumed != read)
-                            throw new InvalidDataException($"分片包含無效的 Base64 內容：{Path.GetFileName(part.Path)}");
-                        await output.WriteAsync(outputBuffer.AsMemory(0, written), cancellationToken);
-                        hash.AppendData(outputBuffer, 0, written);
-                        decodedLength = checked(decodedLength + written);
-                        processed += read;
-                        remaining -= read;
-                        reporter.Report(processed);
-                    }
-                }
+                var (_, header) = await PackageFormat.ReadHeaderAsync(decoded, cancellationToken);
+                if (!header.AsSpan().SequenceEqual(plan.Header)) throw new InvalidDataException("分片標頭已變更，請重新選取分片。");
+                await using Stream output = files.CreateOutput(staged, InputBufferSize);
+                long written = await RestorePayloadAsync(decoded, output, plan.Metadata, hash, cancellationToken);
+                var extra = new byte[1];
+                if (await decoded.ReadAsync(extra, cancellationToken) != 0) throw new InvalidDataException("容器包含多餘資料。");
+                progress?.Report(new ConversionProgress("正在驗證完整性", plan.EncodedLength, plan.EncodedLength));
+                if (written != plan.Metadata.OriginalLength ||
+                    !StringComparer.OrdinalIgnoreCase.Equals(Convert.ToHexString(hash.GetHashAndReset()), plan.Metadata.Sha256))
+                    throw new InvalidDataException("還原內容的大小或 SHA-256 不符，檔案可能已損毀。");
             }
-            string actualHash = Convert.ToHexString(hash.GetHashAndReset());
-            if (plan.Verification is not null &&
-                (decodedLength != plan.Verification.OriginalLength ||
-                 !StringComparer.OrdinalIgnoreCase.Equals(actualHash, plan.Verification.Sha256)))
-                throw new InvalidDataException("還原內容與驗證資訊不符，檔案可能不完整或已損毀。");
             cancellationToken.ThrowIfCancellationRequested();
-            if (File.Exists(destinationPath) && !overwriteApproved)
-                throw new IOException("目的檔案已存在，但尚未同意覆寫；請重新選擇儲存位置。");
-            File.Move(staged, destinationPath, overwriteApproved);
-            installed = true;
-            reporter.Report(plan.EncodedLength, true);
+            if (File.Exists(destinationPath) && !overwriteApproved) throw new IOException("目的檔案已存在，但尚未同意覆寫。");
+            progress?.Report(new ConversionProgress("正在儲存還原檔案", 0, plan.Metadata.OriginalLength));
+            cancellationToken.ThrowIfCancellationRequested();
+            files.MoveFile(staged, destinationPath, overwriteApproved);
         }
-        finally
+        catch (Exception error)
         {
-            if (!installed) DeleteTemporaryFile(staged);
+            try { files.DeleteFile(staged); }
+            catch (Exception cleanup) { throw CleanupError(error, cleanup, staged); }
+            throw;
         }
     }
 
-    private static void ValidateBase64Characters(byte[] bytes, int count, bool finalBlock)
+    private static async Task<long> RestorePayloadAsync(Stream input, Stream output, PackageMetadata metadata,
+        IncrementalHash hash, CancellationToken token)
     {
-        for (int i = 0; i < count; i++)
+        var buffer = new byte[InputBufferSize];
+        var decoded = new byte[InputBufferSize];
+        long remaining = metadata.PayloadLength, writtenTotal = 0;
+        var decoder = new BrotliDecoder();
+        try
         {
-            byte b = bytes[i];
-            bool standard = b is >= (byte)'A' and <= (byte)'Z' or >= (byte)'a' and <= (byte)'z'
-                or >= (byte)'0' and <= (byte)'9' or (byte)'+' or (byte)'/';
-            if (!standard && !(b == (byte)'=' && finalBlock && i >= count - 2))
-                throw new InvalidDataException("分片包含無效的 Base64 字元或填補符號。");
+            if (metadata.Compression == CompressionMethod.None)
+            {
+                while (remaining > 0)
+                {
+                    token.ThrowIfCancellationRequested();
+                    int count = (int)Math.Min(buffer.Length, remaining);
+                    await ReadPayloadExactlyAsync(input, buffer.AsMemory(0, count), token);
+                    await output.WriteAsync(buffer.AsMemory(0, count), token);
+                    hash.AppendData(buffer, 0, count);
+                    writtenTotal += count;
+                    remaining -= count;
+                }
+                return writtenTotal;
+            }
+            int available = 0, offset = 0;
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+                if (offset == available && remaining > 0)
+                {
+                    available = (int)Math.Min(buffer.Length, remaining);
+                    await ReadPayloadExactlyAsync(input, buffer.AsMemory(0, available), token);
+                    remaining -= available;
+                    offset = 0;
+                }
+                OperationStatus status = decoder.Decompress(buffer.AsSpan(offset, available - offset), decoded,
+                    out int consumed, out int written);
+                offset += consumed;
+                if (written > metadata.OriginalLength - writtenTotal) throw new InvalidDataException("解壓縮結果超過宣告大小。");
+                await output.WriteAsync(decoded.AsMemory(0, written), token);
+                hash.AppendData(decoded, 0, written);
+                writtenTotal += written;
+                if (status == OperationStatus.Done)
+                {
+                    if (remaining != 0 || offset != available) throw new InvalidDataException("Brotli 串流包含尾隨資料。");
+                    return writtenTotal;
+                }
+                if (status == OperationStatus.InvalidData ||
+                    (status == OperationStatus.NeedMoreData && (remaining == 0 || offset != available)) ||
+                    (status == OperationStatus.DestinationTooSmall && consumed == 0 && written == 0))
+                    throw new InvalidDataException("Brotli 串流無效或遭截斷。");
+            }
         }
+        finally { decoder.Dispose(); }
     }
 
-    private static void CommitFiles(List<(string Staged, string Destination)> files, string stage,
-        HashSet<string> approved, CancellationToken cancellationToken)
+    private static async Task ReadPayloadExactlyAsync(Stream stream, Memory<byte> buffer, CancellationToken token)
     {
-        var moved = new List<MoveRecord>();
+        try { await stream.ReadExactlyAsync(buffer, token); }
+        catch (EndOfStreamException ex) { throw new InvalidDataException("容器資料遭截斷。", ex); }
+    }
+
+    private static void CommitFiles(List<(string Staged, string Destination)> files, ExportPlan plan,
+        HashSet<string> approved, IProgress<ConversionProgress>? progress, CancellationToken token)
+    {
+        var moved = new List<(string Destination, string? Backup, bool Installed)>();
         try
         {
             for (int i = 0; i < files.Count; i++)
             {
-                cancellationToken.ThrowIfCancellationRequested();
+                progress?.Report(new ConversionProgress("正在提交分片", i * plan.PartByteLimit, plan.EncodedLength));
+                token.ThrowIfCancellationRequested();
                 var (source, destination) = files[i];
                 bool exists = File.Exists(destination);
-                if (exists && !approved.Contains(destination))
-                    throw new IOException($"輸出檔案已存在，但尚未同意覆寫：{destination}");
-                string? backup = exists ? Path.Combine(stage, $"backup-{i:D6}") : null;
-                if (backup is not null) File.Move(destination, backup);
-                var record = new MoveRecord(destination, backup);
-                moved.Add(record);
-                File.Move(source, destination);
-                record.Installed = true;
+                if (exists && !approved.Contains(destination)) throw new IOException($"輸出檔案已存在，但尚未同意覆寫：{destination}");
+                string? backup = exists ? Path.Combine(plan.Stage, $"backup-{i:D6}") : null;
+                if (backup is not null) plan.Files.MoveFile(destination, backup);
+                moved.Add((destination, backup, false));
+                plan.Files.MoveFile(source, destination);
+                moved[^1] = (destination, backup, true);
             }
+            token.ThrowIfCancellationRequested();
         }
         catch (Exception error)
         {
@@ -401,55 +487,34 @@ public static partial class ConversionService
             {
                 try
                 {
-                    MoveRecord record = moved[i];
-                    if (record.Installed) File.Delete(record.Destination);
-                    if (record.Backup is not null) File.Move(record.Backup, record.Destination);
+                    var record = moved[i];
+                    if (record.Installed) plan.Files.DeleteFile(record.Destination);
+                    if (record.Backup is not null) plan.Files.MoveFile(record.Backup, record.Destination);
                 }
-                catch (Exception rollbackError) { rollbackErrors.Add(rollbackError); }
+                catch (Exception rollback) { rollbackErrors.Add(rollback); }
             }
             if (rollbackErrors.Count > 0)
-                throw new RollbackFailedException($"轉換未完成，且部分原檔無法自動復原。備份保留於：{stage}",
+            {
+                plan.KeepBackups = true;
+                throw new IOException($"轉換失敗，且部分原檔無法自動復原。備份保留於：{plan.Stage}",
                     new AggregateException(new[] { error }.Concat(rollbackErrors)));
+            }
             throw;
         }
     }
 
-    private sealed class MoveRecord(string destination, string? backup)
-    {
-        public string Destination { get; } = destination;
-        public string? Backup { get; } = backup;
-        public bool Installed { get; set; }
-    }
+    private static IOException CleanupError(Exception error, Exception cleanup, string path) =>
+        new($"{error.Message}\n另外無法清理暫存資料，請檢查：{path}", new AggregateException(error, cleanup));
+}
 
-    private sealed class RollbackFailedException(string message, Exception inner) : IOException(message, inner);
-
-    private static void DeleteTemporaryDirectory(string path)
+internal sealed class ProgressReporter(IProgress<ConversionProgress>? progress, string message, long total)
+{
+    private long _lastReport = Environment.TickCount64 - 1000;
+    internal void Report(long processed, bool force = false)
     {
-        try { if (Directory.Exists(path)) Directory.Delete(path, recursive: true); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            throw new IOException($"無法清理暫存資料夾，請確認輸出狀態並手動刪除：{path}", ex);
-        }
-    }
-
-    private static void DeleteTemporaryFile(string path)
-    {
-        try { if (File.Exists(path)) File.Delete(path); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            throw new IOException($"無法清理暫存檔案，請確認輸出狀態並手動刪除：{path}", ex);
-        }
-    }
-
-    private sealed class ProgressReporter(IProgress<ConversionProgress>? progress, string message, long total)
-    {
-        private long _lastReport = Environment.TickCount64 - 1000;
-        public void Report(long processed, bool force = false)
-        {
-            long now = Environment.TickCount64;
-            if (!force && now - _lastReport < 100) return;
-            _lastReport = now;
-            progress?.Report(new ConversionProgress(message, processed, total));
-        }
+        long now = Environment.TickCount64;
+        if (!force && now - _lastReport < 100) return;
+        _lastReport = now;
+        progress?.Report(new ConversionProgress(message, processed, total));
     }
 }
